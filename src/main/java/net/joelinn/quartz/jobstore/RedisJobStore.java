@@ -37,6 +37,7 @@ public class RedisJobStore implements JobStore {
      */
     protected int lockTimeout = 30_000;
 
+
     /**
      * Redis host
      */
@@ -373,7 +374,7 @@ public class RedisJobStore implements JobStore {
      */
     @Override
     public JobDetail retrieveJob(final JobKey jobKey) throws JobPersistenceException {
-        return doWithLock(new LockCallback<JobDetail>() {
+        return doWithoutLock(new LockCallback<JobDetail>() {
             @Override
             public JobDetail doWithLock(JedisCommands jedis) throws JobPersistenceException {
                 try {
@@ -492,7 +493,7 @@ public class RedisJobStore implements JobStore {
      */
     @Override
     public OperableTrigger retrieveTrigger(final TriggerKey triggerKey) throws JobPersistenceException {
-        return doWithLock(new LockCallback<OperableTrigger>() {
+        return doWithoutLock(new LockCallback<OperableTrigger>() {
             @Override
             public OperableTrigger doWithLock(JedisCommands jedis) throws JobPersistenceException {
                 return storage.retrieveTrigger(triggerKey, jedis);
@@ -510,7 +511,7 @@ public class RedisJobStore implements JobStore {
      */
     @Override
     public boolean checkExists(final JobKey jobKey) throws JobPersistenceException {
-        return doWithLock(new LockCallback<Boolean>() {
+        return doWithoutLock(new LockCallback<Boolean>() {
             @Override
             public Boolean doWithLock(JedisCommands jedis) throws JobPersistenceException {
                 return storage.checkExists(jobKey, jedis);
@@ -528,7 +529,7 @@ public class RedisJobStore implements JobStore {
      */
     @Override
     public boolean checkExists(final TriggerKey triggerKey) throws JobPersistenceException {
-        return doWithLock(new LockCallback<Boolean>() {
+        return doWithoutLock(new LockCallback<Boolean>() {
             @Override
             public Boolean doWithLock(JedisCommands jedis) throws JobPersistenceException {
                 return storage.checkExists(triggerKey, jedis);
@@ -616,7 +617,7 @@ public class RedisJobStore implements JobStore {
      */
     @Override
     public Calendar retrieveCalendar(final String calName) throws JobPersistenceException {
-        return doWithLock(new LockCallback<Calendar>() {
+        return doWithoutLock(new LockCallback<Calendar>() {
             @Override
             public Calendar doWithLock(JedisCommands jedis) throws JobPersistenceException {
                 return storage.retrieveCalendar(calName, jedis);
@@ -630,7 +631,7 @@ public class RedisJobStore implements JobStore {
      */
     @Override
     public int getNumberOfJobs() throws JobPersistenceException {
-        return  doWithLock(new LockCallback<Integer>() {
+        return  doWithoutLock(new LockCallback<Integer>() {
             @Override
             public Integer doWithLock(JedisCommands jedis) throws JobPersistenceException {
                 return storage.getNumberOfJobs(jedis);
@@ -644,7 +645,7 @@ public class RedisJobStore implements JobStore {
      */
     @Override
     public int getNumberOfTriggers() throws JobPersistenceException {
-        return doWithLock(new LockCallback<Integer>() {
+        return doWithoutLock(new LockCallback<Integer>() {
             @Override
             public Integer doWithLock(JedisCommands jedis) throws JobPersistenceException {
                 return storage.getNumberOfTriggers(jedis);
@@ -658,7 +659,7 @@ public class RedisJobStore implements JobStore {
      */
     @Override
     public int getNumberOfCalendars() throws JobPersistenceException {
-        return doWithLock(new LockCallback<Integer>() {
+        return doWithoutLock(new LockCallback<Integer>() {
             @Override
             public Integer doWithLock(JedisCommands jedis) throws JobPersistenceException {
                 return storage.getNumberOfCalendars(jedis);
@@ -679,7 +680,7 @@ public class RedisJobStore implements JobStore {
      */
     @Override
     public Set<JobKey> getJobKeys(final GroupMatcher<JobKey> matcher) throws JobPersistenceException {
-        return doWithLock(new LockCallback<Set<JobKey>>() {
+        return doWithoutLock(new LockCallback<Set<JobKey>>() {
             @Override
             public Set<JobKey> doWithLock(JedisCommands jedis) throws JobPersistenceException {
                 return storage.getJobKeys(matcher, jedis);
@@ -700,7 +701,7 @@ public class RedisJobStore implements JobStore {
      */
     @Override
     public Set<TriggerKey> getTriggerKeys(final GroupMatcher<TriggerKey> matcher) throws JobPersistenceException {
-        return doWithLock(new LockCallback<Set<TriggerKey>>() {
+        return doWithoutLock(new LockCallback<Set<TriggerKey>>() {
             @Override
             public Set<TriggerKey> doWithLock(JedisCommands jedis) throws JobPersistenceException {
                 return storage.getTriggerKeys(matcher, jedis);
@@ -719,7 +720,7 @@ public class RedisJobStore implements JobStore {
      */
     @Override
     public List<String> getJobGroupNames() throws JobPersistenceException {
-        return doWithLock(new LockCallback<List<String>>() {
+        return doWithoutLock(new LockCallback<List<String>>() {
             @Override
             public List<String> doWithLock(JedisCommands jedis) throws JobPersistenceException {
                 return storage.getJobGroupNames(jedis);
@@ -738,7 +739,7 @@ public class RedisJobStore implements JobStore {
      */
     @Override
     public List<String> getTriggerGroupNames() throws JobPersistenceException {
-        return doWithLock(new LockCallback<List<String>>() {
+        return doWithoutLock(new LockCallback<List<String>>() {
             @Override
             public List<String> doWithLock(JedisCommands jedis) throws JobPersistenceException {
                 return storage.getTriggerGroupNames(jedis);
@@ -757,7 +758,7 @@ public class RedisJobStore implements JobStore {
      */
     @Override
     public List<String> getCalendarNames() throws JobPersistenceException {
-        return doWithLock(new LockCallback<List<String>>() {
+        return doWithoutLock(new LockCallback<List<String>>() {
             @Override
             public List<String> doWithLock(JedisCommands jedis) throws JobPersistenceException {
                 return storage.getCalendarNames(jedis);
@@ -776,7 +777,7 @@ public class RedisJobStore implements JobStore {
      */
     @Override
     public List<OperableTrigger> getTriggersForJob(final JobKey jobKey) throws JobPersistenceException {
-        return doWithLock(new LockCallback<List<OperableTrigger>>() {
+        return doWithoutLock(new LockCallback<List<OperableTrigger>>() {
             @Override
             public List<OperableTrigger> doWithLock(JedisCommands jedis) throws JobPersistenceException {
                 return storage.getTriggersForJob(jobKey, jedis);
@@ -792,7 +793,7 @@ public class RedisJobStore implements JobStore {
      */
     @Override
     public Trigger.TriggerState getTriggerState(final TriggerKey triggerKey) throws JobPersistenceException {
-        return doWithLock(new LockCallback<Trigger.TriggerState>() {
+        return doWithoutLock(new LockCallback<Trigger.TriggerState>() {
             @Override
             public Trigger.TriggerState doWithLock(JedisCommands jedis) throws JobPersistenceException {
                 return storage.getTriggerState(triggerKey, jedis);
@@ -928,7 +929,7 @@ public class RedisJobStore implements JobStore {
 
     @Override
     public Set<String> getPausedTriggerGroups() throws JobPersistenceException {
-        return doWithLock(new LockCallback<Set<String>>() {
+        return doWithoutLock(new LockCallback<Set<String>>() {
             @Override
             public Set<String> doWithLock(JedisCommands jedis) throws JobPersistenceException {
                 return storage.getPausedTriggerGroups(jedis);
@@ -1176,6 +1177,31 @@ public class RedisJobStore implements JobStore {
         }
     }
 
+
+    /**
+     * Execute a read-only callback without taking the global lock. Read operations only need a connection: they do
+     * not modify any state, so there is no need to serialize them against writers (and listing many triggers would
+     * otherwise pay a lock round trip per call and compete with trigger acquisition for the lock).
+     */
+    protected <T> T doWithoutLock(LockCallback<T> callback, String errorMessage) throws JobPersistenceException {
+        JedisCommands jedis = null;
+        try {
+            jedis = getResource();
+            try {
+                return callback.doWithLock(jedis);
+            } catch (Exception e) {
+                if (errorMessage == null || errorMessage.isEmpty()) {
+                    errorMessage = "Job storage error.";
+                }
+                throw new JobPersistenceException(errorMessage, e);
+            }
+        } finally {
+            if (jedis != null && jedis instanceof Jedis) {
+                // only close if we're not using a JedisCluster instance
+                ((Jedis) jedis).close();
+            }
+        }
+    }
 
     private JedisCommands getResource() throws JobPersistenceException {
         if (jedisCluster != null) {
