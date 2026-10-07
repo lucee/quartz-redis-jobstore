@@ -39,7 +39,7 @@ public abstract class BaseIntegrationTest {
 
         jedisPool = new JedisPool(host, port);
         try (Jedis jedis = jedisPool.getResource()) {
-            jedis.flushAll();
+            jedis.flushDB();
         }
 
 

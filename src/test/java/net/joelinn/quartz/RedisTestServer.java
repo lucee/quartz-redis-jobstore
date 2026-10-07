@@ -8,8 +8,14 @@ import java.util.Arrays;
 import java.util.concurrent.TimeUnit;
 
 /**
- * A single Redis server (docker container) shared by all tests of a JVM. Requires the docker CLI and a running
- * Docker daemon. The image can be overridden with -Dtest.redis.image=... (default: redis:7-alpine).
+ * A single Redis server shared by all tests of a JVM.
+ * <ul>
+ * <li>If the environment variable REDIS_SERVER is set (and optionally REDIS_PORT, default 6379) that server is used,
+ * for example the service container in CI. The tests flush the databases they use: never point this at a Redis
+ * holding data you care about.</li>
+ * <li>Otherwise a Redis docker container is started (needs the docker CLI and a running Docker daemon). The image can
+ * be overridden with -Dtest.redis.image=... (default: redis:7-alpine).</li>
+ * </ul>
  *
  * Plain docker CLI is used on purpose: this keeps the test classpath free of extra libraries that would force
  * newer versions of the library's runtime dependencies.
@@ -19,14 +25,24 @@ public final class RedisTestServer {
     private static String host = "localhost";
     private static int port = -1;
     private static String containerId;
+    private static boolean externalServer;
 
     private RedisTestServer() {}
 
     private static synchronized void start() {
-        if (containerId != null) {
+        if (containerId != null || externalServer) {
             return;
         }
         try {
+            String externalHost = System.getenv("REDIS_SERVER");
+            if (externalHost != null && !externalHost.trim().isEmpty()) {
+                host = externalHost.trim();
+                String externalPort = System.getenv("REDIS_PORT");
+                port = externalPort == null || externalPort.trim().isEmpty() ? 6379 : Integer.parseInt(externalPort.trim());
+                waitUntilReady();
+                externalServer = true;
+                return;
+            }
             String image = System.getProperty("test.redis.image", "redis:7-alpine");
             // the forked test JVM may exit without running shutdown hooks: remove containers left over from earlier runs
             for (String old : docker("ps", "-aq", "--filter", "label=" + LABEL).trim().split("\\s+")) {

@@ -5,6 +5,20 @@ on: [push, pull_request, workflow_dispatch]
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      # the tests use this Redis instead of starting one in docker (see RedisTestServer)
+      REDIS_SERVER: localhost
+      REDIS_PORT: 6379
+    services:
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
     strategy:
       fail-fast: false
       matrix:
@@ -28,7 +42,6 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-maven-
 
-      # the tests start a Redis server in docker (see RedisTestServer), docker is available on the runner
       - name: Build and test
         run: mvn -B -e verify -Dgpg.skip
 
