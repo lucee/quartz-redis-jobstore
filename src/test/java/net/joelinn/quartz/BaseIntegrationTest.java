@@ -13,12 +13,10 @@ import org.slf4j.LoggerFactory;
 import redis.clients.jedis.Jedis;
 import redis.clients.jedis.JedisPool;
 import redis.clients.jedis.util.Pool;
-import redis.embedded.RedisServer;
 
 import java.util.Properties;
 import java.util.concurrent.atomic.AtomicInteger;
 
-import static net.joelinn.quartz.TestUtils.getPort;
 
 /**
  * @author Joe Linn
@@ -27,26 +25,25 @@ import static net.joelinn.quartz.TestUtils.getPort;
 public abstract class BaseIntegrationTest {
     private static final Logger log = LoggerFactory.getLogger(BaseIntegrationTest.class);
 
-    protected RedisServer redisServer;
     protected Scheduler scheduler;
     protected Pool<Jedis> jedisPool;
 
     protected int port;
-    protected static final String HOST = "localhost";
+    protected String host;
 
 
     @Before
     public void setUp() throws Exception {
-        port = getPort();
-        redisServer = RedisServer.builder()
-                .port(port)
-                .build();
-        redisServer.start();
+        host = RedisTestServer.host();
+        port = RedisTestServer.port();
 
-        jedisPool = new JedisPool(HOST, port);
+        jedisPool = new JedisPool(host, port);
+        try (Jedis jedis = jedisPool.getResource()) {
+            jedis.flushDB();
+        }
 
 
-        scheduler = new StdSchedulerFactory(schedulerConfig(HOST, port)).getScheduler();
+        scheduler = new StdSchedulerFactory(schedulerConfig(host, port)).getScheduler();
         scheduler.start();
     }
 
@@ -58,7 +55,6 @@ public abstract class BaseIntegrationTest {
         config.setProperty("org.quartz.jobStore.port", String.valueOf(port));
         config.setProperty("org.quartz.threadPool.threadCount", "1");
         config.setProperty("org.quartz.jobStore.misfireThreshold", "500");
-        config.setProperty(StdSchedulerFactory.PROP_SCHED_SKIP_UPDATE_CHECK, "true");
         return config;
     }
 
@@ -69,7 +65,6 @@ public abstract class BaseIntegrationTest {
         if (jedisPool != null) {
             jedisPool.close();
         }
-        redisServer.stop();
     }
 
 

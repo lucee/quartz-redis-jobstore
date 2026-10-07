@@ -1,4 +1,12 @@
 # Changelog
+### 1.2.0.1-RC (Lucee fork, [LDEV-6531](https://luceeserver.atlassian.net/browse/LDEV-6531))
+* `retrieveTrigger` and `retrieveJob` read the hash and the data map in one round trip (pipelined)
+* New `RedisJobStore.getAllTriggerDetails()`: all triggers with job and state in a few pipelined requests, independent of the number of triggers (takes the global lock once, so the result is a consistent snapshot)
+* Implement `getAcquireRetryDelay` and `resetTriggerFromErrorState` (added to the `JobStore` interface in Quartz 2.3)
+* Build against Quartz 2.3.2 and Java 11; runtime dependencies unchanged (Jedis 3.3.0, Jackson 2.11.1)
+* Tests run against a real Redis (docker or `REDIS_SERVER`) instead of embedded-redis; the embedded-redis based sentinel test was removed
+* Published as `org.lucee:quartz-redis-jobstore`
+
 ### 2019-07-02
 * Upgrade to Jedis 3.0.1
 

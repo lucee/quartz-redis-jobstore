@@ -50,7 +50,7 @@ public class MultiSchedulerIntegrationTest extends BaseIntegrationTest {
     @Override
     public void setUp() throws Exception {
         super.setUp();
-        Properties props = schedulerConfig(HOST, port);
+        Properties props = schedulerConfig(host, port);
         props.setProperty(StdSchedulerFactory.PROP_SCHED_INSTANCE_NAME, "second");
         props.setProperty(StdSchedulerFactory.PROP_SCHED_BATCH_TIME_WINDOW, "500");
         props.setProperty(StdSchedulerFactory.PROP_SCHED_IDLE_WAIT_TIME, "1000");

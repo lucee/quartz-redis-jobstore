@@ -37,6 +37,7 @@ public class RedisJobStore implements JobStore {
      */
     protected int lockTimeout = 30_000;
 
+
     /**
      * Redis host
      */
@@ -189,6 +190,23 @@ public class RedisJobStore implements JobStore {
         }
         storage.setMisfireThreshold(misfireThreshold)
                 .setClusterCheckInterval(clusterCheckinInterval);
+    }
+
+    /**
+     * Read all triggers together with their job and state. For a single Redis node this takes a handful of
+     * pipelined requests, independent of the number of triggers, whereas listing them through the scheduler
+     * needs several requests per trigger. Takes the global lock once, so the result is a consistent snapshot
+     * (a trigger is never seen halfway between two states).
+     *
+     * @return all triggers with job and state; the job is null for a trigger without a job
+     */
+    public List<TriggerDetails> getAllTriggerDetails() throws JobPersistenceException {
+        return doWithLock(new LockCallback<List<TriggerDetails>>() {
+            @Override
+            public List<TriggerDetails> doWithLock(JedisCommands jedis) throws JobPersistenceException {
+                return storage.getAllTriggerDetails(jedis);
+            }
+        }, "Could not retrieve triggers.");
     }
 
     /**
@@ -1289,6 +1307,36 @@ public class RedisJobStore implements JobStore {
     @Override
     public void setThreadPoolSize(int poolSize) {
         // nothing to do
+    }
+
+    /**
+     * Reset a trigger from the ERROR state back to NORMAL (or PAUSED if its group is paused).
+     * Required by {@link org.quartz.spi.JobStore} since Quartz 2.3.
+     *
+     * @param triggerKey the key of the trigger to reset
+     */
+    @Override
+    public void resetTriggerFromErrorState(final TriggerKey triggerKey) throws JobPersistenceException {
+        doWithLock(new LockCallbackWithoutResult() {
+            @Override
+            public Void doWithLock(JedisCommands jedis) throws JobPersistenceException {
+                storage.resetTriggerFromErrorState(triggerKey, jedis);
+                return null;
+            }
+        }, "Could not reset trigger from error state.");
+    }
+
+    /**
+     * Delay (in ms) the scheduler waits before retrying after a failed trigger acquisition.
+     * Required by {@link org.quartz.spi.JobStore} since Quartz 2.3. Uses the same fixed delay as
+     * Quartz's in-memory store.
+     *
+     * @param failureCount the number of consecutive failures
+     * @return the delay in milliseconds
+     */
+    @Override
+    public long getAcquireRetryDelay(int failureCount) {
+        return 20;
     }
 
     private Set<HostAndPort> buildNodesSetFromHost() {
