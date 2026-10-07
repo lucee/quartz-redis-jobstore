@@ -177,6 +177,21 @@ public abstract class AbstractRedisStorage<T extends JedisCommands> {
     }
 
     /**
+     * Read two hashes. The default implementation issues two sequential requests; implementations which can pipeline
+     * (a single connection) override this to fetch both in one round trip.
+     * @param firstKey key of the first hash
+     * @param secondKey key of the second hash
+     * @param jedis a thread-safe Redis connection
+     * @return a two element list holding the content of the first and the second hash (never null, maybe empty maps)
+     */
+    protected List<Map<String, String>> hgetAllTwo(String firstKey, String secondKey, T jedis) {
+        List<Map<String, String>> result = new ArrayList<>(2);
+        result.add(jedis.hgetAll(firstKey));
+        result.add(jedis.hgetAll(secondKey));
+        return result;
+    }
+
+    /**
      * Retrieve a job from redis
      * @param jobKey the job key detailing the identity of the job to be retrieved
      * @param jedis a thread-safe Redis connection
@@ -188,7 +203,8 @@ public abstract class AbstractRedisStorage<T extends JedisCommands> {
         final String jobHashKey = redisSchema.jobHashKey(jobKey);
         final String jobDataMapHashKey = redisSchema.jobDataMapHashKey(jobKey);
 
-        final Map<String, String> jobDetailMap = jedis.hgetAll(jobHashKey);
+        final List<Map<String, String>> maps = hgetAllTwo(jobHashKey, jobDataMapHashKey, jedis);
+        final Map<String, String> jobDetailMap = maps.get(0);
         if(jobDetailMap == null || jobDetailMap.size() == 0){
             // desired job does not exist
             return null;
@@ -196,7 +212,7 @@ public abstract class AbstractRedisStorage<T extends JedisCommands> {
         JobDetailImpl jobDetail = mapper.convertValue(jobDetailMap, JobDetailImpl.class);
         jobDetail.setKey(jobKey);
 
-        final Map<String, String> jobData = jedis.hgetAll(jobDataMapHashKey);
+        final Map<String, String> jobData = maps.get(1);
         if(jobData != null && !jobData.isEmpty()){
             JobDataMap jobDataMap = new JobDataMap();
             jobDataMap.putAll(jobData);
@@ -278,7 +294,8 @@ public abstract class AbstractRedisStorage<T extends JedisCommands> {
      */
     public OperableTrigger retrieveTrigger(TriggerKey triggerKey, T jedis) throws JobPersistenceException{
         final String triggerHashKey = redisSchema.triggerHashKey(triggerKey);
-        Map<String, String> triggerMap = jedis.hgetAll(triggerHashKey);
+        final List<Map<String, String>> maps = hgetAllTwo(triggerHashKey, redisSchema.triggerDataMapHashKey(triggerKey), jedis);
+        Map<String, String> triggerMap = maps.get(0);
         if(triggerMap == null || triggerMap.isEmpty()){
             logger.debug(String.format("No trigger exists for key %s", triggerHashKey));
             return null;
@@ -292,7 +309,7 @@ public abstract class AbstractRedisStorage<T extends JedisCommands> {
         triggerMap.remove(TRIGGER_CLASS);
         OperableTrigger operableTrigger = (OperableTrigger) mapper.convertValue(triggerMap, triggerClass);
         operableTrigger.setFireInstanceId(schedulerInstanceId + "-" + operableTrigger.getKey() + "-" + operableTrigger.getStartTime().getTime());
-        final Map<String, String> jobData = jedis.hgetAll(redisSchema.triggerDataMapHashKey(triggerKey));
+        final Map<String, String> jobData = maps.get(1);
         if (jobData != null && !jobData.isEmpty()){
             JobDataMap jobDataMap = new JobDataMap();
             jobDataMap.putAll(jobData);

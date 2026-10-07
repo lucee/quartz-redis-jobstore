@@ -254,6 +254,21 @@ public class RedisStorage extends AbstractRedisStorage<Jedis> {
      * @return true if the trigger was removed, false if the trigger was stateless
      * @throws org.quartz.JobPersistenceException if the unset operation failed
      */
+    /**
+     * Read two hashes in a single round trip using a pipeline.
+     */
+    @Override
+    protected List<Map<String, String>> hgetAllTwo(String firstKey, String secondKey, Jedis jedis) {
+        Pipeline pipe = jedis.pipelined();
+        Response<Map<String, String>> first = pipe.hgetAll(firstKey);
+        Response<Map<String, String>> second = pipe.hgetAll(secondKey);
+        pipe.sync();
+        List<Map<String, String>> result = new ArrayList<>(2);
+        result.add(first.get());
+        result.add(second.get());
+        return result;
+    }
+
     @Override
     public boolean unsetTriggerState(final String triggerHashKey, Jedis jedis) throws JobPersistenceException {
         boolean removed = false;
