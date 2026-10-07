@@ -17,12 +17,10 @@ import redis.clients.jedis.JedisPool;
 import redis.clients.jedis.JedisPoolConfig;
 import redis.clients.jedis.Protocol;
 import redis.clients.jedis.util.Pool;
-import redis.embedded.RedisServer;
 
 import java.io.IOException;
 import java.util.*;
 
-import static net.joelinn.quartz.TestUtils.getPort;
 import static org.hamcrest.CoreMatchers.not;
 import static org.hamcrest.CoreMatchers.nullValue;
 import static org.hamcrest.MatcherAssert.assertThat;
@@ -36,8 +34,6 @@ import static org.mockito.Mockito.mock;
  */
 public abstract class BaseTest {
     private static final Logger logger = LoggerFactory.getLogger(BaseTest.class);
-
-    protected RedisServer redisServer;
 
     protected Pool<Jedis> jedisPool;
 
@@ -55,12 +51,8 @@ public abstract class BaseTest {
 
     @Before
     public void setUpRedis() throws IOException, SchedulerConfigException {
-        port = getPort();
-        logger.debug("Attempting to start embedded Redis server on port " + port);
-        redisServer = RedisServer.builder()
-                .port(port)
-                .build();
-        redisServer.start();
+        host = RedisTestServer.host();
+        port = RedisTestServer.port();
         final short database = 1;
         JedisPoolConfig jedisPoolConfig = new JedisPoolConfig();
         jedisPoolConfig.setTestOnBorrow(true);
@@ -85,7 +77,6 @@ public abstract class BaseTest {
     public void tearDownRedis() throws InterruptedException {
         jedis.close();
         jedisPool.destroy();
-        redisServer.stop();
     }
 
     protected JobDetail getJobDetail(){

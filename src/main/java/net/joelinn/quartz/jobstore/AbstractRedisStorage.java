@@ -302,6 +302,23 @@ public abstract class AbstractRedisStorage<T extends JedisCommands> {
     }
 
     /**
+     * Move a trigger out of the ERROR state: back to WAITING, or to PAUSED if its group is paused.
+     * Does nothing if the trigger is not in the ERROR state.
+     * @param triggerKey the key of the trigger to reset
+     * @param jedis a thread-safe Redis connection
+     */
+    public void resetTriggerFromErrorState(TriggerKey triggerKey, T jedis) throws JobPersistenceException {
+        final String triggerHashKey = redisSchema.triggerHashKey(triggerKey);
+        final Double score = jedis.zscore(redisSchema.triggerStateKey(RedisTriggerState.ERROR), triggerHashKey);
+        if (score == null) {
+            // not in error state: nothing to do
+            return;
+        }
+        final boolean groupPaused = jedis.sismember(redisSchema.pausedTriggerGroupsSet(), redisSchema.triggerGroupSetKey(triggerKey));
+        setTriggerState(groupPaused ? RedisTriggerState.PAUSED : RedisTriggerState.WAITING, score, triggerHashKey, jedis);
+    }
+
+    /**
      * Retrieve triggers associated with the given job
      * @param jobKey the job for which to retrieve triggers
      * @param jedis a thread-safe Redis connection

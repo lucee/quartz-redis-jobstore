@@ -1291,6 +1291,36 @@ public class RedisJobStore implements JobStore {
         // nothing to do
     }
 
+    /**
+     * Reset a trigger from the ERROR state back to NORMAL (or PAUSED if its group is paused).
+     * Required by {@link org.quartz.spi.JobStore} since Quartz 2.3.
+     *
+     * @param triggerKey the key of the trigger to reset
+     */
+    @Override
+    public void resetTriggerFromErrorState(final TriggerKey triggerKey) throws JobPersistenceException {
+        doWithLock(new LockCallbackWithoutResult() {
+            @Override
+            public Void doWithLock(JedisCommands jedis) throws JobPersistenceException {
+                storage.resetTriggerFromErrorState(triggerKey, jedis);
+                return null;
+            }
+        }, "Could not reset trigger from error state.");
+    }
+
+    /**
+     * Delay (in ms) the scheduler waits before retrying after a failed trigger acquisition.
+     * Required by {@link org.quartz.spi.JobStore} since Quartz 2.3. Uses the same fixed delay as
+     * Quartz's in-memory store.
+     *
+     * @param failureCount the number of consecutive failures
+     * @return the delay in milliseconds
+     */
+    @Override
+    public long getAcquireRetryDelay(int failureCount) {
+        return 20;
+    }
+
     private Set<HostAndPort> buildNodesSetFromHost() {
         Set<HostAndPort> nodes = new HashSet<>();
         for (String hostName : host.split(",")) {
