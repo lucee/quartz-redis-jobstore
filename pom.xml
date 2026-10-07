@@ -243,6 +243,8 @@
                 <version>3.5.5</version>
                 <configuration>
                     <skipTests>false</skipTests>
+                    <!-- the (test only) mocking library needs reflective access on newer JDKs -->
+                    <argLine>--add-opens java.base/java.lang=ALL-UNNAMED</argLine>
                 </configuration>
             </plugin>
         </plugins>
