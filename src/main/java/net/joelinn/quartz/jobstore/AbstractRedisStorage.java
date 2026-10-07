@@ -209,16 +209,23 @@ public abstract class AbstractRedisStorage<T extends JedisCommands> {
             // desired job does not exist
             return null;
         }
+        return buildJob(jobKey, jobDetailMap, maps.get(1));
+    }
+
+    /**
+     * Convert the content of a job hash and its data map hash into a job detail.
+     * @param jobKey the key of the job
+     * @param jobDetailMap the job hash (not empty)
+     * @param dataMap the job data map hash (may be null or empty)
+     */
+    protected JobDetail buildJob(JobKey jobKey, Map<String, String> jobDetailMap, Map<String, String> dataMap) {
         JobDetailImpl jobDetail = mapper.convertValue(jobDetailMap, JobDetailImpl.class);
         jobDetail.setKey(jobKey);
-
-        final Map<String, String> jobData = maps.get(1);
-        if(jobData != null && !jobData.isEmpty()){
+        if(dataMap != null && !dataMap.isEmpty()){
             JobDataMap jobDataMap = new JobDataMap();
-            jobDataMap.putAll(jobData);
+            jobDataMap.putAll(dataMap);
             jobDetail.setJobDataMap(jobDataMap);
         }
-
         return jobDetail;
     }
 
@@ -300,6 +307,15 @@ public abstract class AbstractRedisStorage<T extends JedisCommands> {
             logger.debug(String.format("No trigger exists for key %s", triggerHashKey));
             return null;
         }
+        return buildTrigger(triggerMap, maps.get(1));
+    }
+
+    /**
+     * Convert the content of a trigger hash and its data map hash into a trigger.
+     * @param triggerMap the trigger hash (will be modified)
+     * @param dataMap the trigger data map hash (may be null or empty)
+     */
+    protected OperableTrigger buildTrigger(Map<String, String> triggerMap, Map<String, String> dataMap) throws JobPersistenceException {
         Class triggerClass;
         try {
             triggerClass = Class.forName(triggerMap.get(TRIGGER_CLASS));
@@ -309,13 +325,42 @@ public abstract class AbstractRedisStorage<T extends JedisCommands> {
         triggerMap.remove(TRIGGER_CLASS);
         OperableTrigger operableTrigger = (OperableTrigger) mapper.convertValue(triggerMap, triggerClass);
         operableTrigger.setFireInstanceId(schedulerInstanceId + "-" + operableTrigger.getKey() + "-" + operableTrigger.getStartTime().getTime());
-        final Map<String, String> jobData = maps.get(1);
-        if (jobData != null && !jobData.isEmpty()){
+        if (dataMap != null && !dataMap.isEmpty()){
             JobDataMap jobDataMap = new JobDataMap();
-            jobDataMap.putAll(jobData);
+            jobDataMap.putAll(dataMap);
             operableTrigger.setJobDataMap(jobDataMap);
         }
         return operableTrigger;
+    }
+
+    /**
+     * Read all triggers together with their job and state. This default implementation reads key by key; storages
+     * which can pipeline requests override it.
+     * @param jedis a thread-safe Redis connection
+     * @return all triggers with job and state; triggers which disappear while reading are skipped
+     */
+    public List<TriggerDetails> getAllTriggerDetails(T jedis) throws JobPersistenceException {
+        final Set<String> triggerHashKeys = jedis.smembers(redisSchema.triggersSet());
+        final List<TriggerDetails> result = new ArrayList<>(triggerHashKeys.size());
+        final Map<JobKey, JobDetail> jobs = new HashMap<>();
+        for (String triggerHashKey : triggerHashKeys) {
+            final TriggerKey triggerKey = redisSchema.triggerKey(triggerHashKey);
+            final OperableTrigger trigger = retrieveTrigger(triggerKey, jedis);
+            if (trigger == null) {
+                continue;
+            }
+            JobDetail job = jobs.get(trigger.getJobKey());
+            if (job == null && !jobs.containsKey(trigger.getJobKey())) {
+                try {
+                    job = retrieveJob(trigger.getJobKey(), jedis);
+                } catch (ClassNotFoundException e) {
+                    throw new JobPersistenceException("Error retrieving job: " + e.getMessage(), e);
+                }
+                jobs.put(trigger.getJobKey(), job);
+            }
+            result.add(new TriggerDetails(trigger, job, getTriggerState(triggerKey, jedis)));
+        }
+        return result;
     }
 
     /**

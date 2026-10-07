@@ -254,6 +254,95 @@ public class RedisStorage extends AbstractRedisStorage<Jedis> {
      * @return true if the trigger was removed, false if the trigger was stateless
      * @throws org.quartz.JobPersistenceException if the unset operation failed
      */
+    /** number of triggers/jobs read per pipeline, to bound the size of a single request/response */
+    private static final int BULK_CHUNK_SIZE = 500;
+
+    /**
+     * Read all triggers, their jobs and their states using a handful of pipelined requests instead of
+     * several requests per trigger.
+     */
+    @Override
+    public List<TriggerDetails> getAllTriggerDetails(Jedis jedis) throws JobPersistenceException {
+        // 1. trigger keys and the state of every trigger (one pipeline: 1 SMEMBERS + one ZRANGE per state)
+        final RedisTriggerState[] states = RedisTriggerState.values();
+        final Pipeline statePipe = jedis.pipelined();
+        final Response<Set<String>> triggerKeysResponse = statePipe.smembers(redisSchema.triggersSet());
+        final List<Response<Set<String>>> stateMembers = new ArrayList<>(states.length);
+        for (RedisTriggerState state : states) {
+            stateMembers.add(statePipe.zrange(redisSchema.triggerStateKey(state), 0, -1));
+        }
+        statePipe.sync();
+        final Map<String, Trigger.TriggerState> stateByTrigger = new HashMap<>();
+        for (int i = 0; i < states.length; i++) {
+            for (String triggerHashKey : stateMembers.get(i).get()) {
+                // same precedence as getTriggerState(): the first state in enum order wins
+                if (!stateByTrigger.containsKey(triggerHashKey)) {
+                    stateByTrigger.put(triggerHashKey, states[i].getTriggerState());
+                }
+            }
+        }
+
+        // 2. triggers (hash + data map)
+        final List<String> triggerHashKeys = new ArrayList<>(triggerKeysResponse.get());
+        final Map<String, OperableTrigger> triggers = new HashMap<>(triggerHashKeys.size());
+        for (int from = 0; from < triggerHashKeys.size(); from += BULK_CHUNK_SIZE) {
+            final List<String> chunk = triggerHashKeys.subList(from, Math.min(from + BULK_CHUNK_SIZE, triggerHashKeys.size()));
+            final Pipeline pipe = jedis.pipelined();
+            final List<Response<Map<String, String>>> hashes = new ArrayList<>(chunk.size());
+            final List<Response<Map<String, String>>> dataMaps = new ArrayList<>(chunk.size());
+            for (String triggerHashKey : chunk) {
+                final TriggerKey triggerKey = redisSchema.triggerKey(triggerHashKey);
+                hashes.add(pipe.hgetAll(triggerHashKey));
+                dataMaps.add(pipe.hgetAll(redisSchema.triggerDataMapHashKey(triggerKey)));
+            }
+            pipe.sync();
+            for (int i = 0; i < chunk.size(); i++) {
+                final Map<String, String> triggerMap = hashes.get(i).get();
+                if (triggerMap == null || triggerMap.isEmpty()) {
+                    continue; // removed while we were reading
+                }
+                triggers.put(chunk.get(i), buildTrigger(triggerMap, dataMaps.get(i).get()));
+            }
+        }
+
+        // 3. jobs (hash + data map), each job once
+        final List<JobKey> jobKeys = new ArrayList<>();
+        final Set<JobKey> seen = new HashSet<>();
+        for (OperableTrigger trigger : triggers.values()) {
+            if (seen.add(trigger.getJobKey())) {
+                jobKeys.add(trigger.getJobKey());
+            }
+        }
+        final Map<JobKey, JobDetail> jobs = new HashMap<>(jobKeys.size());
+        for (int from = 0; from < jobKeys.size(); from += BULK_CHUNK_SIZE) {
+            final List<JobKey> chunk = jobKeys.subList(from, Math.min(from + BULK_CHUNK_SIZE, jobKeys.size()));
+            final Pipeline pipe = jedis.pipelined();
+            final List<Response<Map<String, String>>> hashes = new ArrayList<>(chunk.size());
+            final List<Response<Map<String, String>>> dataMaps = new ArrayList<>(chunk.size());
+            for (JobKey jobKey : chunk) {
+                hashes.add(pipe.hgetAll(redisSchema.jobHashKey(jobKey)));
+                dataMaps.add(pipe.hgetAll(redisSchema.jobDataMapHashKey(jobKey)));
+            }
+            pipe.sync();
+            for (int i = 0; i < chunk.size(); i++) {
+                final Map<String, String> jobMap = hashes.get(i).get();
+                if (jobMap == null || jobMap.isEmpty()) {
+                    continue; // job does not exist
+                }
+                jobs.put(chunk.get(i), buildJob(chunk.get(i), jobMap, dataMaps.get(i).get()));
+            }
+        }
+
+        // 4. assemble
+        final List<TriggerDetails> result = new ArrayList<>(triggers.size());
+        for (Map.Entry<String, OperableTrigger> entry : triggers.entrySet()) {
+            Trigger.TriggerState state = stateByTrigger.get(entry.getKey());
+            result.add(new TriggerDetails(entry.getValue(), jobs.get(entry.getValue().getJobKey()),
+                    state != null ? state : Trigger.TriggerState.NONE));
+        }
+        return result;
+    }
+
     /**
      * Read two hashes in a single round trip using a pipeline.
      */

@@ -193,6 +193,22 @@ public class RedisJobStore implements JobStore {
     }
 
     /**
+     * Read all triggers together with their job and state. For a single Redis node this takes a handful of
+     * pipelined requests, independent of the number of triggers, whereas listing them through the scheduler
+     * needs several requests per trigger. Does not take the global lock.
+     *
+     * @return all triggers with job and state; the job is null for a trigger without a job
+     */
+    public List<TriggerDetails> getAllTriggerDetails() throws JobPersistenceException {
+        return doWithoutLock(new LockCallback<List<TriggerDetails>>() {
+            @Override
+            public List<TriggerDetails> doWithLock(JedisCommands jedis) throws JobPersistenceException {
+                return storage.getAllTriggerDetails(jedis);
+            }
+        }, "Could not retrieve triggers.");
+    }
+
+    /**
      * Called by the QuartzScheduler to inform the <code>JobStore</code> that
      * the scheduler has started.
      */
