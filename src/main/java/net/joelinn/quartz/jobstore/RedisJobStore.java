@@ -135,6 +135,12 @@ public class RedisJobStore implements JobStore {
      */
     protected long heartbeatInterval = 5_000;
 
+    /**
+     * Check a connection with a PING each time it is taken from the pool (default, safest). Turning it off saves one round
+     * trip per operation, a connection which broke since it was used last then makes the next operation fail once.
+     */
+    protected boolean testOnBorrow = true;
+
     private ScheduledExecutorService heartbeat;
 
 
@@ -157,6 +163,10 @@ public class RedisJobStore implements JobStore {
 
     public void setReleaseTriggersInterval(long interval) {
         this.releaseTriggersInterval = interval;
+    }
+
+    public void setTestOnBorrow(boolean testOnBorrow) {
+        this.testOnBorrow = testOnBorrow;
     }
 
     public void setHeartbeatInterval(long interval) {
@@ -200,7 +210,7 @@ public class RedisJobStore implements JobStore {
             storage = new RedisClusterStorage(redisSchema, mapper, signaler, instanceId, lockTimeout);
         } else if (jedisPool == null) {
             JedisPoolConfig jedisPoolConfig = new JedisPoolConfig();
-            jedisPoolConfig.setTestOnBorrow(true);
+            jedisPoolConfig.setTestOnBorrow(testOnBorrow);
             if (redisSentinel) {
                 Set<HostAndPort> nodes = buildNodesSetFromHost();
                 Set<String> nodesAsStrings = new HashSet<>();
@@ -267,6 +277,7 @@ public class RedisJobStore implements JobStore {
             logger.warn("clusterCheckinInterval ({} ms) should be at least three times the heartbeatInterval ({} ms), otherwise a short pause makes this scheduler look dead.",
                     clusterCheckinInterval, heartbeatInterval);
         }
+        storage.setHeartbeatRunning(true);
         heartbeat = Executors.newSingleThreadScheduledExecutor(new ThreadFactory() {
             @Override
             public Thread newThread(Runnable r) {
@@ -297,6 +308,9 @@ public class RedisJobStore implements JobStore {
         if (heartbeat != null) {
             heartbeat.shutdownNow();
             heartbeat = null;
+            if (storage != null) {
+                storage.setHeartbeatRunning(false);
+            }
         }
     }
 

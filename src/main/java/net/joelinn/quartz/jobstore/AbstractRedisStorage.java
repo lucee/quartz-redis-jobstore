@@ -63,6 +63,12 @@ public abstract class AbstractRedisStorage<T extends JedisCommands> {
      */
     protected long acquiredTriggerGrace = 60_000;
 
+    /** true while the heartbeat thread of the job store registers this scheduler as alive */
+    protected volatile boolean heartbeatRunning = false;
+
+    /** local time before which the release check does not have to ask Redis again (only used while the heartbeat runs) */
+    private volatile long nextReleaseCheck = 0;
+
     /**
      * The value of the currently held Redis lock (if any)
      */
@@ -79,6 +85,11 @@ public abstract class AbstractRedisStorage<T extends JedisCommands> {
     public AbstractRedisStorage setMisfireThreshold(int misfireThreshold) {
         this.misfireThreshold = misfireThreshold;
         return this;
+    }
+
+    public void setHeartbeatRunning(boolean running) {
+        this.heartbeatRunning = running;
+        this.nextReleaseCheck = 0;
     }
 
     public AbstractRedisStorage setReleaseTriggersInterval(long releaseTriggersInterval) {
@@ -126,10 +137,22 @@ public abstract class AbstractRedisStorage<T extends JedisCommands> {
      * @return true if lock was successfully removed; false otherwise
      */
     public boolean unlock(T jedis){
-        final String currentLock = jedis.get(redisSchema.lockKey());
-        if(!isNullOrEmpty(currentLock) && UUID.fromString(currentLock).equals(lockValue)){
-            // This is our lock.  We can remove it.
-            jedis.del(redisSchema.lockKey());
+        final UUID ours = lockValue;
+        if (ours == null) {
+            return false;
+        }
+        // remove the lock only if it is still ours
+        return deleteIfEquals(redisSchema.lockKey(), ours.toString(), jedis);
+    }
+
+    /**
+     * Delete a key if it holds the given value. Needs two requests here; storages which can do it in one (Lua) override this.
+     * @return true if the key was deleted
+     */
+    protected boolean deleteIfEquals(String key, String value, T jedis) {
+        final String current = jedis.get(key);
+        if (!isNullOrEmpty(current) && current.equals(value)) {
+            jedis.del(key);
             return true;
         }
         return false;
@@ -838,7 +861,19 @@ public abstract class AbstractRedisStorage<T extends JedisCommands> {
     protected void releaseTriggersCron(T jedis) throws JobPersistenceException {
         // has it been more than the release interval since we last released orphaned triggers
         // or is this the first check upon initialization
-        if(isTriggerLockTimeoutExceeded(jedis) || !isActiveInstance(schedulerInstanceId, jedis)){
+        final long now = System.currentTimeMillis();
+        if (heartbeatRunning) {
+            // we register ourselves, only the release interval matters. It is asked from Redis at most every half second
+            // (a stopping scheduler resets it to make the others look sooner)
+            if (now < nextReleaseCheck) {
+                return;
+            }
+            nextReleaseCheck = now + Math.min(releaseTriggersInterval, 500);
+            if (isTriggerLockTimeoutExceeded(jedis)) {
+                releaseAllOrphanedTriggers(jedis);
+            }
+        }
+        else if(isTriggerLockTimeoutExceeded(jedis) || !isActiveInstance(schedulerInstanceId, jedis)){
             releaseAllOrphanedTriggers(jedis);
         }
     }
@@ -981,7 +1016,10 @@ public abstract class AbstractRedisStorage<T extends JedisCommands> {
      */
     public List<OperableTrigger> acquireNextTriggers(long noLaterThan, int maxCount, long timeWindow, T jedis) throws JobPersistenceException, ClassNotFoundException {
         releaseTriggersCron(jedis);
-        setLastInstanceActiveTime(schedulerInstanceId, System.currentTimeMillis(), jedis);
+        if (!heartbeatRunning) {
+            // the heartbeat thread does this while it runs
+            setLastInstanceActiveTime(schedulerInstanceId, System.currentTimeMillis(), jedis);
+        }
         List<OperableTrigger> acquiredTriggers = new ArrayList<>();
         boolean retry;
         do{

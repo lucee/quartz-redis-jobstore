@@ -257,37 +257,61 @@ public class RedisStorage extends AbstractRedisStorage<Jedis> {
      * @throws org.quartz.JobPersistenceException if the unset operation failed
      */
     /**
-     * Set the state of a trigger in one atomic step (MULTI/EXEC): it is removed from all state sets, added to the new one and
-     * its owner marker (trigger lock) is set or removed. Before, this took several steps, a scheduler which stopped in
-     * between left the trigger in no state set, where nothing finds it again.
+     * Queue the atomic change of the state of a trigger (MULTI ... EXEC) on a pipeline, nothing is sent before the pipeline
+     * is synced: the trigger is removed from all state sets, added to the new one (none if state is null) and its owner
+     * marker (trigger lock) is set or removed. Optional fields of the trigger hash are written in the same step.
+     * @return the response of the ZADD, null if state is null
+     */
+    private Response<Long> queueTriggerState(Pipeline pipe, RedisTriggerState state, double score, String triggerHashKey, boolean lock, Map<String, String> hashFields) {
+        final String lockKey = redisSchema.triggerLockKey(redisSchema.triggerKey(triggerHashKey));
+        pipe.multi();
+        if (hashFields != null && !hashFields.isEmpty()) {
+            pipe.hset(triggerHashKey, hashFields);
+        }
+        for (RedisTriggerState s : RedisTriggerState.values()) {
+            pipe.zrem(redisSchema.triggerStateKey(s), triggerHashKey);
+        }
+        Response<Long> added = null;
+        if (state != null) {
+            added = pipe.zadd(redisSchema.triggerStateKey(state), score, triggerHashKey);
+        }
+        if (lock && state != null) {
+            pipe.set(lockKey, schedulerInstanceId, SetParams.setParams().px(TRIGGER_LOCK_TIMEOUT));
+        } else {
+            pipe.del(lockKey);
+        }
+        pipe.exec();
+        return added;
+    }
+
+    /**
+     * Set the state of a trigger in one atomic step (MULTI/EXEC, one round trip): it is removed from all state sets, added
+     * to the new one and its owner marker (trigger lock) is set or removed. Before, this took several steps, a scheduler
+     * which stopped in between left the trigger in no state set, where nothing finds it again.
      */
     @Override
     public boolean setTriggerState(final RedisTriggerState state, final double score, final String triggerHashKey, final boolean lock, Jedis jedis) throws JobPersistenceException {
         if (state == null) {
             return false;
         }
-        final String lockKey = redisSchema.triggerLockKey(redisSchema.triggerKey(triggerHashKey));
-        final Transaction tx = jedis.multi();
-        try {
-            for (RedisTriggerState s : RedisTriggerState.values()) {
-                tx.zrem(redisSchema.triggerStateKey(s), triggerHashKey);
-            }
-            final Response<Long> added = tx.zadd(redisSchema.triggerStateKey(state), score, triggerHashKey);
-            if (lock) {
-                tx.set(lockKey, schedulerInstanceId, SetParams.setParams().px(TRIGGER_LOCK_TIMEOUT));
-            } else {
-                tx.del(lockKey);
-            }
-            tx.exec();
-            return added.get() == 1;
-        } finally {
-            tx.close();
-        }
+        final Pipeline pipe = jedis.pipelined();
+        final Response<Long> added = queueTriggerState(pipe, state, score, triggerHashKey, lock, null);
+        pipe.sync();
+        return added.get() == 1;
     }
 
     @Override
     public boolean setTriggerState(final RedisTriggerState state, final double score, final String triggerHashKey, Jedis jedis) throws JobPersistenceException {
         return setTriggerState(state, score, triggerHashKey, false, jedis);
+    }
+
+    private static final String DELETE_IF_EQUALS = "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end";
+
+    /** compare and delete in one request */
+    @Override
+    protected boolean deleteIfEquals(String key, String value, Jedis jedis) {
+        final Object result = jedis.eval(DELETE_IF_EQUALS, 1, key, value);
+        return result instanceof Long && (Long) result == 1L;
     }
 
     /** number of triggers/jobs read per pipeline, to bound the size of a single request/response */
@@ -810,10 +834,16 @@ public class RedisStorage extends AbstractRedisStorage<Jedis> {
         List<TriggerFiredResult> results = new ArrayList<>();
         for (OperableTrigger trigger : triggers) {
             final String triggerHashKey = redisSchema.triggerHashKey(trigger.getKey());
+            final JobKey jobKey = trigger.getJobKey();
+            final String jobHashKey = redisSchema.jobHashKey(jobKey);
             logger.debug(String.format("Trigger %s fired.", triggerHashKey));
+            // everything which is read, in one request: the trigger, its job and the triggers of the job
             Pipeline pipe = jedis.pipelined();
             Response<Boolean> triggerExistsResponse = pipe.exists(triggerHashKey);
             Response<Double> triggerAcquiredResponse = pipe.zscore(redisSchema.triggerStateKey(RedisTriggerState.ACQUIRED), triggerHashKey);
+            Response<Map<String, String>> jobResponse = pipe.hgetAll(jobHashKey);
+            Response<Map<String, String>> jobDataResponse = pipe.hgetAll(redisSchema.jobDataMapHashKey(jobKey));
+            Response<Set<String>> jobTriggersResponse = pipe.smembers(redisSchema.jobTriggersSetKey(jobKey));
             pipe.sync();
             if(!triggerExistsResponse.get() || triggerAcquiredResponse.get() == null){
                 // the trigger does not exist or the trigger is not acquired
@@ -837,56 +867,70 @@ public class RedisStorage extends AbstractRedisStorage<Jedis> {
             final Date previousFireTime = trigger.getPreviousFireTime();
             trigger.triggered(calendar);
 
-            // set the trigger state to WAITING
             final Date nextFireDate = trigger.getNextFireTime();
-            long nextFireTime = 0;
-            if (nextFireDate != null) {
-                nextFireTime = nextFireDate.getTime();
-                jedis.hset(triggerHashKey, TRIGGER_NEXT_FIRE_TIME, Long.toString(nextFireTime));
-                setTriggerState(RedisTriggerState.WAITING, (double) nextFireTime, triggerHashKey, jedis);
+            final long nextFireTime = nextFireDate != null ? nextFireDate.getTime() : 0;
+            final Map<String, String> fireTimes = new HashMap<>(2);
+            fireTimes.put(TRIGGER_NEXT_FIRE_TIME, nextFireDate != null ? Long.toString(nextFireTime) : "");
+            fireTimes.put(TRIGGER_PREVIOUS_FIRE_TIME, Long.toString(System.currentTimeMillis()));
+
+            final Map<String, String> jobMap = jobResponse.get();
+            final JobDetail job = jobMap == null || jobMap.isEmpty() ? null : buildJob(jobKey, jobMap, jobDataResponse.get());
+            if (job == null) {
+                // the job is gone: release the trigger, it cannot fire
+                logger.debug(String.format("Job %s of trigger %s does not exist.", jobHashKey, triggerHashKey));
+                pipe = jedis.pipelined();
+                queueTriggerState(pipe, nextFireDate != null ? RedisTriggerState.WAITING : null, nextFireTime, triggerHashKey, false, fireTimes);
+                pipe.sync();
+                continue;
             }
+            final TriggerFiredBundle triggerFiredBundle = new TriggerFiredBundle(job, trigger, calendar, false, new Date(), previousFireTime, previousFireTime, nextFireDate);
 
-            JobDetail job = retrieveJob(trigger.getJobKey(), jedis);
-            TriggerFiredBundle triggerFiredBundle = new TriggerFiredBundle(job, trigger, calendar, false, new Date(), previousFireTime, previousFireTime, nextFireDate);
-
-            // handling jobs for which concurrent execution is disallowed
-            if (isJobConcurrentExecutionDisallowed(job.getJobClass())){
+            if (!isJobConcurrentExecutionDisallowed(job.getJobClass())) {
+                // next fire time, previous fire time and the state WAITING (or no state if there is no next fire time) in one step
+                pipe = jedis.pipelined();
+                queueTriggerState(pipe, nextFireDate != null ? RedisTriggerState.WAITING : null, nextFireTime, triggerHashKey, false, fireTimes);
+                pipe.sync();
+            }
+            else {
+                // a job for which concurrent execution is disallowed: its triggers are blocked while it runs
                 if (logger.isTraceEnabled()) {
                     logger.trace("Firing trigger " + trigger.getKey() + " for job " + job.getKey() + " for which concurrent execution is disallowed. Adding job to blocked jobs set.");
                 }
-                final String jobHashKey = redisSchema.jobHashKey(trigger.getJobKey());
-                final String jobTriggerSetKey = redisSchema.jobTriggersSetKey(job.getKey());
-                for (String nonConcurrentTriggerHashKey : jedis.smembers(jobTriggerSetKey)) {
-                    Double score = jedis.zscore(redisSchema.triggerStateKey(RedisTriggerState.WAITING), nonConcurrentTriggerHashKey);
-                    if(score != null){
-                        if (logger.isTraceEnabled()) {
-                            logger.trace("Setting state of trigger " + trigger.getKey() + " for non-concurrent job " + job.getKey() + " to BLOCKED.");
-                        }
-                        setTriggerState(RedisTriggerState.BLOCKED, score, nonConcurrentTriggerHashKey, true, jedis);
+                // the state of the other triggers of the job, in one request
+                final Map<String, Response<Double>> waiting = new LinkedHashMap<>();
+                final Map<String, Response<Double>> paused = new HashMap<>();
+                pipe = jedis.pipelined();
+                for (String siblingHashKey : jobTriggersResponse.get()) {
+                    if (!siblingHashKey.equals(triggerHashKey)) {
+                        waiting.put(siblingHashKey, pipe.zscore(redisSchema.triggerStateKey(RedisTriggerState.WAITING), siblingHashKey));
+                        paused.put(siblingHashKey, pipe.zscore(redisSchema.triggerStateKey(RedisTriggerState.PAUSED), siblingHashKey));
                     }
-                    else{
-                        score = jedis.zscore(redisSchema.triggerStateKey(RedisTriggerState.PAUSED), nonConcurrentTriggerHashKey);
-                        if(score != null){
-                            if (logger.isTraceEnabled()) {
-                                logger.trace("Setting state of trigger " + trigger.getKey() + " for non-concurrent job " + job.getKey() + " to PAUSED_BLOCKED.");
-                            }
-                            setTriggerState(RedisTriggerState.PAUSED_BLOCKED, score, nonConcurrentTriggerHashKey, true, jedis);
+                }
+                pipe.sync();
+
+                // and all changes in one request. The fired trigger goes from ACQUIRED straight to BLOCKED (before: via WAITING,
+                // where another scheduler could acquire it before it was blocked)
+                pipe = jedis.pipelined();
+                if (nextFireDate != null) {
+                    queueTriggerState(pipe, RedisTriggerState.BLOCKED, nextFireTime, triggerHashKey, true, fireTimes);
+                } else {
+                    pipe.hset(triggerHashKey, TRIGGER_PREVIOUS_FIRE_TIME, fireTimes.get(TRIGGER_PREVIOUS_FIRE_TIME));
+                }
+                for (Map.Entry<String, Response<Double>> sibling : waiting.entrySet()) {
+                    final Double waitingScore = sibling.getValue().get();
+                    if (waitingScore != null) {
+                        queueTriggerState(pipe, RedisTriggerState.BLOCKED, waitingScore, sibling.getKey(), true, null);
+                    } else {
+                        final Double pausedScore = paused.get(sibling.getKey()).get();
+                        if (pausedScore != null) {
+                            queueTriggerState(pipe, RedisTriggerState.PAUSED_BLOCKED, pausedScore, sibling.getKey(), true, null);
                         }
                     }
                 }
-                pipe = jedis.pipelined();
                 pipe.set(redisSchema.jobBlockedKey(job.getKey()), schedulerInstanceId);
                 pipe.sadd(redisSchema.blockedJobsSet(), jobHashKey);
                 pipe.sync();
-            } else if(nextFireDate != null){
-                jedis.hset(triggerHashKey, TRIGGER_NEXT_FIRE_TIME, Long.toString(nextFireTime));
-                logger.debug(String.format("Releasing trigger %s with next fire time %s. Setting state to WAITING.", triggerHashKey, nextFireTime));
-                setTriggerState(RedisTriggerState.WAITING, (double) nextFireTime, triggerHashKey, jedis);
-            } else {
-                jedis.hset(triggerHashKey, TRIGGER_NEXT_FIRE_TIME, "");
-                unsetTriggerState(triggerHashKey, jedis);
             }
-            jedis.hset(triggerHashKey, TRIGGER_PREVIOUS_FIRE_TIME, Long.toString(System.currentTimeMillis()));
 
             results.add(new TriggerFiredResult(triggerFiredBundle));
         }
@@ -911,39 +955,59 @@ public class RedisStorage extends AbstractRedisStorage<Jedis> {
         final String jobDataMapHashKey = redisSchema.jobDataMapHashKey(jobDetail.getKey());
         final String triggerHashKey = redisSchema.triggerHashKey(trigger.getKey());
         logger.debug(String.format("Job %s completed.", jobHashKey));
-        if(jedis.exists(jobHashKey)) {
+        // what is read: does the job and the trigger still exist, the triggers of the job. One request
+        Pipeline readPipe = jedis.pipelined();
+        final Response<Boolean> jobExists = readPipe.exists(jobHashKey);
+        final Response<Boolean> triggerExistsResponse = readPipe.exists(triggerHashKey);
+        final Response<Set<String>> jobTriggers = readPipe.smembers(redisSchema.jobTriggersSetKey(jobDetail.getKey()));
+        readPipe.sync();
+        if(jobExists.get()) {
             // job was not deleted during execution
-            Pipeline pipe;
+            final boolean disallowConcurrent = isJobConcurrentExecutionDisallowed(jobDetail.getJobClass());
+            // the state of the blocked triggers of the job, in one request
+            final Map<String, Response<Double>> blocked = new LinkedHashMap<>();
+            final Map<String, Response<Double>> pausedBlocked = new HashMap<>();
+            if (disallowConcurrent && !jobTriggers.get().isEmpty()) {
+                readPipe = jedis.pipelined();
+                for (String triggerOfJob : jobTriggers.get()) {
+                    blocked.put(triggerOfJob, readPipe.zscore(redisSchema.triggerStateKey(RedisTriggerState.BLOCKED), triggerOfJob));
+                    pausedBlocked.put(triggerOfJob, readPipe.zscore(redisSchema.triggerStateKey(RedisTriggerState.PAUSED_BLOCKED), triggerOfJob));
+                }
+                readPipe.sync();
+            }
+            // all changes in one request
+            final Pipeline pipe = jedis.pipelined();
+            boolean write = false;
             if (isPersistJobDataAfterExecution(jobDetail.getJobClass())) {
                 // update the job data map
                 JobDataMap jobDataMap = jobDetail.getJobDataMap();
-                pipe = jedis.pipelined();
                 pipe.del(jobDataMapHashKey);
                 if (jobDataMap != null && !jobDataMap.isEmpty()) {
                     pipe.hmset(jobDataMapHashKey, getStringDataMap(jobDataMap));
                 }
-                pipe.syncAndReturnAll();
+                write = true;
             }
-            if (isJobConcurrentExecutionDisallowed(jobDetail.getJobClass())) {
-                // unblock the job
-                pipe = jedis.pipelined();
+            if (disallowConcurrent) {
+                // unblock the job and its triggers
                 pipe.srem(redisSchema.blockedJobsSet(), jobHashKey);
                 pipe.del(redisSchema.jobBlockedKey(jobDetail.getKey()));
-                pipe.syncAndReturnAll();
-
-                final String jobTriggersSetKey = redisSchema.jobTriggersSetKey(jobDetail.getKey());
-                for (String nonConcurrentTriggerHashKey : jedis.smembers(jobTriggersSetKey)) {
-                    Double score = jedis.zscore(redisSchema.triggerStateKey(RedisTriggerState.BLOCKED), nonConcurrentTriggerHashKey);
-                    if (score != null) {
-                        setTriggerState(RedisTriggerState.WAITING, score, nonConcurrentTriggerHashKey, jedis);
-                    }
-                    else {
-                        score = jedis.zscore(redisSchema.triggerStateKey(RedisTriggerState.PAUSED_BLOCKED), nonConcurrentTriggerHashKey);
-                        if (score != null) {
-                            setTriggerState(RedisTriggerState.PAUSED, score, nonConcurrentTriggerHashKey, jedis);
+                for (Map.Entry<String, Response<Double>> blockedTrigger : blocked.entrySet()) {
+                    final Double blockedScore = blockedTrigger.getValue().get();
+                    if (blockedScore != null) {
+                        queueTriggerState(pipe, RedisTriggerState.WAITING, blockedScore, blockedTrigger.getKey(), false, null);
+                    } else {
+                        final Double pausedScore = pausedBlocked.get(blockedTrigger.getKey()).get();
+                        if (pausedScore != null) {
+                            queueTriggerState(pipe, RedisTriggerState.PAUSED, pausedScore, blockedTrigger.getKey(), false, null);
                         }
                     }
                 }
+                write = true;
+            }
+            if (write) {
+                pipe.sync();
+            }
+            if (disallowConcurrent) {
                 signaler.signalSchedulingChange(0L);
             }
         }
@@ -952,7 +1016,7 @@ public class RedisStorage extends AbstractRedisStorage<Jedis> {
             jedis.srem(redisSchema.blockedJobsSet(), jobHashKey);
         }
 
-        if(jedis.exists(triggerHashKey)){
+        if(triggerExistsResponse.get()){
             // trigger was not deleted during job execution
             if(triggerInstCode == Trigger.CompletedExecutionInstruction.DELETE_TRIGGER){
                 if(trigger.getNextFireTime() == null){

@@ -8,6 +8,13 @@ Recovery of the triggers of a scheduler which stopped or died, and atomic state 
 * **Trigger state changes are atomic** (MULTI/EXEC, single Redis node): a trigger is never in no state set. Before, a scheduler which stopped between "remove" and "add" left the trigger in no state set, where nothing found it again. Blocked and acquired triggers are marked with their owner in the same step.
 * **Every acquired trigger is marked with its owner** (before: only triggers of jobs without concurrent execution). An acquired trigger without a marker (acquired by a scheduler running an older version) is only released when it is overdue by more than 60 s.
 * A blocked trigger is not released while the scheduler which blocked its job is alive, also when the trigger lock (10 minutes) has expired, so a job which runs longer than that is not started a second time.
+* **Fewer round trips to Redis** (one job run, acquire + fire + complete, measured against a Redis with network latency, in round trips): concurrent job 34 -> 17, stateful job 41 -> 19; stateful fire 17 -> 5, idle poll 8 -> 4. With a short network latency this is what limits how many jobs a cluster can start per second, because most of it happens inside the global lock.
+  * releasing the global lock is one request (Lua compare-and-delete) instead of two
+  * a trigger state change is one request (MULTI/EXEC inside a pipeline) instead of two
+  * the heartbeat thread replaces the activity write and the self check of every acquire; whether releases are due is asked from Redis at most every half second
+  * `triggersFired` and `triggeredJobComplete` read in one request and write in one request, and no longer do the same writes twice; a fired stateful trigger goes from ACQUIRED straight to BLOCKED (before: via WAITING, where another scheduler could acquire it)
+  * new setting `testOnBorrow` (default true, as before): `false` skips the PING when a connection is taken from the pool, saves one more round trip per operation; a connection which broke since it was used last then makes the next operation fail once
+  * benchmark: `PerformanceBenchmarkTest` (`-Dbenchmark=true`)
 * Redis Cluster mode keeps the old, non atomic state changes (keys in different slots).
 * Do not mix with schedulers running 1.x with a short `clusterCheckinInterval`: they do not send a heartbeat.
 
