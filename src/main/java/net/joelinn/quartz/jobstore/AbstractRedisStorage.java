@@ -54,6 +54,15 @@ public abstract class AbstractRedisStorage<T extends JedisCommands> {
 
     protected long clusterCheckInterval = 4 * 60 * 1000;
 
+    /** minimum time (ms) between two runs which release the triggers of dead schedulers */
+    protected long releaseTriggersInterval = TRIGGER_LOCK_TIMEOUT;
+
+    /**
+     * An acquired trigger which has no owner marker (acquired by a scheduler running an older version of this store)
+     * is only released when its fire time is at least this long (ms) in the past: a live scheduler fires it right away.
+     */
+    protected long acquiredTriggerGrace = 60_000;
+
     /**
      * The value of the currently held Redis lock (if any)
      */
@@ -69,6 +78,11 @@ public abstract class AbstractRedisStorage<T extends JedisCommands> {
 
     public AbstractRedisStorage setMisfireThreshold(int misfireThreshold) {
         this.misfireThreshold = misfireThreshold;
+        return this;
+    }
+
+    public AbstractRedisStorage setReleaseTriggersInterval(long releaseTriggersInterval) {
+        this.releaseTriggersInterval = releaseTriggersInterval;
         return this;
     }
 
@@ -415,6 +429,19 @@ public abstract class AbstractRedisStorage<T extends JedisCommands> {
      * @return true if set, false if the trigger was already a member of the given state's sorted set and its score was updated
      * @throws JobPersistenceException if the set operation fails
      */
+    /**
+     * Set the state of a trigger and optionally mark this scheduler as its owner (trigger lock), so that other
+     * schedulers do not release the trigger while this scheduler is alive. Storages which can do this in one atomic
+     * step override it; the default is the old two step behaviour.
+     */
+    public boolean setTriggerState(final RedisTriggerState state, final double score, final String triggerHashKey, final boolean lock, T jedis) throws JobPersistenceException {
+        final boolean success = setTriggerState(state, score, triggerHashKey, jedis);
+        if (lock && success) {
+            lockTrigger(redisSchema.triggerKey(triggerHashKey), jedis);
+        }
+        return success;
+    }
+
     public boolean setTriggerState(final RedisTriggerState state, final double score, final String triggerHashKey, T jedis) throws JobPersistenceException{
         boolean success = false;
         if(state != null){
@@ -743,21 +770,64 @@ public abstract class AbstractRedisStorage<T extends JedisCommands> {
     }
 
     /**
-     * Release triggers from the given current state to the new state if its locking scheduler has not
-     * registered as alive in the last 10 minutes
+     * Release triggers from the given current state to the new state if the scheduler which owns them is not alive any more.
+     * A scheduler is alive if it registered as active in the last {@link #clusterCheckInterval} ms.
+     * <ul>
+     * <li>The owner is the scheduler stored in the trigger lock. For a blocked trigger it is also the scheduler which blocked the job:
+     * the trigger lock expires after 10 minutes, a job may run longer.</li>
+     * <li>An acquired trigger without any owner marker comes from a scheduler running an older version of this store, it is only
+     * released when its fire time is more than {@link #acquiredTriggerGrace} ms in the past.</li>
+     * </ul>
      * @param currentState the current state of the orphaned trigger
      * @param newState the new state of the orphaned trigger
+     * @param protectedTriggers triggers (hash keys) which belong to a job blocked by a live scheduler, never released
      * @param jedis a thread-safe Redis connection
      */
-    protected void releaseOrphanedTriggers(RedisTriggerState currentState, RedisTriggerState newState, T jedis) throws JobPersistenceException {
+    protected void releaseOrphanedTriggers(RedisTriggerState currentState, RedisTriggerState newState, Set<String> protectedTriggers, T jedis) throws JobPersistenceException {
         for (Tuple triggerTuple : jedis.zrangeWithScores(redisSchema.triggerStateKey(currentState), 0, -1)) {
-            final String lockId = jedis.get(redisSchema.triggerLockKey(redisSchema.triggerKey(triggerTuple.getElement())));
-            if(isNullOrEmpty(lockId) || !isActiveInstance(lockId, jedis)){
-                // Lock key has expired. We can safely alter the trigger's state.
-                logger.debug(String.format("Changing state of orphaned trigger %s from %s to %s.", triggerTuple.getElement(), currentState, newState));
-                setTriggerState(newState, triggerTuple.getScore(), triggerTuple.getElement(), jedis);
+            final String triggerHashKey = triggerTuple.getElement();
+            final String lockId = jedis.get(redisSchema.triggerLockKey(redisSchema.triggerKey(triggerHashKey)));
+            if (!isNullOrEmpty(lockId) && isActiveInstance(lockId, jedis)) {
+                continue; // owned by a live scheduler
+            }
+            if (currentState == RedisTriggerState.ACQUIRED) {
+                if (isNullOrEmpty(lockId) && System.currentTimeMillis() - (long) triggerTuple.getScore() < acquiredTriggerGrace) {
+                    continue; // no owner marker and not overdue yet
+                }
+            }
+            else if (protectedTriggers.contains(triggerHashKey)) {
+                continue; // its job is still running on a live scheduler
+            }
+            logger.debug(String.format("Changing state of orphaned trigger %s from %s to %s.", triggerHashKey, currentState, newState));
+            setTriggerState(newState, triggerTuple.getScore(), triggerHashKey, jedis);
+        }
+    }
+
+    /**
+     * @return the triggers (hash keys) of all jobs which are blocked by a live scheduler
+     */
+    protected Set<String> triggersOfJobsBlockedByLiveScheduler(T jedis) {
+        final Set<String> result = new HashSet<>();
+        for (String jobHashKey : jedis.smembers(redisSchema.blockedJobsSet())) {
+            final JobKey jobKey = redisSchema.jobKey(jobHashKey);
+            final String blocker = jedis.get(redisSchema.jobBlockedKey(jobKey));
+            if (!isNullOrEmpty(blocker) && isActiveInstance(blocker, jedis)) {
+                result.addAll(jedis.smembers(redisSchema.jobTriggersSetKey(jobKey)));
             }
         }
+        return result;
+    }
+
+    /**
+     * Release the triggers of schedulers which ceased to function (now, independent of the release interval).
+     * @param jedis a thread-safe Redis connection
+     */
+    public void releaseAllOrphanedTriggers(T jedis) throws JobPersistenceException {
+        final Set<String> blocked = triggersOfJobsBlockedByLiveScheduler(jedis);
+        releaseOrphanedTriggers(RedisTriggerState.ACQUIRED, RedisTriggerState.WAITING, blocked, jedis);
+        releaseOrphanedTriggers(RedisTriggerState.BLOCKED, RedisTriggerState.WAITING, blocked, jedis);
+        releaseOrphanedTriggers(RedisTriggerState.PAUSED_BLOCKED, RedisTriggerState.PAUSED, blocked, jedis);
+        settLastTriggerReleaseTime(System.currentTimeMillis(), jedis);
     }
 
     /**
@@ -766,14 +836,40 @@ public abstract class AbstractRedisStorage<T extends JedisCommands> {
      * @throws JobPersistenceException
      */
     protected void releaseTriggersCron(T jedis) throws JobPersistenceException {
-        // has it been more than 10 minutes since we last released orphaned triggers
+        // has it been more than the release interval since we last released orphaned triggers
         // or is this the first check upon initialization
         if(isTriggerLockTimeoutExceeded(jedis) || !isActiveInstance(schedulerInstanceId, jedis)){
-            releaseOrphanedTriggers(RedisTriggerState.ACQUIRED, RedisTriggerState.WAITING, jedis);
-            releaseOrphanedTriggers(RedisTriggerState.BLOCKED, RedisTriggerState.WAITING, jedis);
-            releaseOrphanedTriggers(RedisTriggerState.PAUSED_BLOCKED, RedisTriggerState.PAUSED, jedis);
-            settLastTriggerReleaseTime(System.currentTimeMillis(), jedis);
+            releaseAllOrphanedTriggers(jedis);
         }
+    }
+
+    /**
+     * Register this scheduler as alive (independent of the scheduling loop, which may be blocked for a long time
+     * if all worker threads are busy).
+     * @param jedis a thread-safe Redis connection
+     */
+    public void heartbeat(T jedis) {
+        setLastInstanceActiveTime(schedulerInstanceId, System.currentTimeMillis(), jedis);
+    }
+
+    /**
+     * Tell the other schedulers that this one is gone: it is removed from the active schedulers and the next
+     * scheduler which looks for work releases the triggers it still owns right away.
+     * Not done while this scheduler still owns a running job (shutdown without waiting for the jobs): the job goes on,
+     * so the scheduler stays registered and its triggers are only released when it has not been seen for the
+     * check-in interval, as for a scheduler which died.
+     * @param jedis a thread-safe Redis connection
+     * @return true if the scheduler was unregistered
+     */
+    public boolean markInstanceStopped(T jedis) {
+        for (String jobHashKey : jedis.smembers(redisSchema.blockedJobsSet())) {
+            if (schedulerInstanceId.equals(jedis.get(redisSchema.jobBlockedKey(redisSchema.jobKey(jobHashKey))))) {
+                return false;
+            }
+        }
+        removeLastInstanceActiveTime(schedulerInstanceId, jedis);
+        jedis.del(redisSchema.lastTriggerReleaseTime());
+        return true;
     }
 
     /**
@@ -782,7 +878,7 @@ public abstract class AbstractRedisStorage<T extends JedisCommands> {
      * @return if the last trigger release time exceeds the trigger lock timeout.
      */
     protected boolean isTriggerLockTimeoutExceeded(T jedis) {
-        return System.currentTimeMillis() - getLastTriggersReleaseTime(jedis) > TRIGGER_LOCK_TIMEOUT;
+        return System.currentTimeMillis() - getLastTriggersReleaseTime(jedis) > releaseTriggersInterval;
     }
 
     /**
@@ -928,11 +1024,9 @@ public abstract class AbstractRedisStorage<T extends JedisCommands> {
                     }
                 }
                 // acquire the trigger
-                setTriggerState(RedisTriggerState.ACQUIRED, triggerTuple.getScore(), triggerTuple.getElement(), jedis);
-                if (job != null && isJobConcurrentExecutionDisallowed(job.getJobClass())) {
-                    // setting the trigger state above will have removed any lock which was present, so we need to lock the trigger, again
-                    lockTrigger(trigger.getKey(), jedis);
-                }
+                // every acquired trigger is marked with its owner, so that other schedulers can tell a trigger of a live scheduler
+                // from an orphaned one (before, only triggers of jobs without concurrent execution were marked)
+                setTriggerState(RedisTriggerState.ACQUIRED, triggerTuple.getScore(), triggerTuple.getElement(), true, jedis);
                 acquiredTriggers.add(trigger);
                 logger.debug(String.format("Trigger %s acquired", triggerTuple.getElement()));
             }

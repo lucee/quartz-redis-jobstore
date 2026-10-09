@@ -16,6 +16,8 @@ import org.slf4j.LoggerFactory;
 import redis.clients.jedis.Jedis;
 import redis.clients.jedis.Pipeline;
 import redis.clients.jedis.Response;
+import redis.clients.jedis.Transaction;
+import redis.clients.jedis.params.SetParams;
 
 import java.util.*;
 
@@ -254,6 +256,40 @@ public class RedisStorage extends AbstractRedisStorage<Jedis> {
      * @return true if the trigger was removed, false if the trigger was stateless
      * @throws org.quartz.JobPersistenceException if the unset operation failed
      */
+    /**
+     * Set the state of a trigger in one atomic step (MULTI/EXEC): it is removed from all state sets, added to the new one and
+     * its owner marker (trigger lock) is set or removed. Before, this took several steps, a scheduler which stopped in
+     * between left the trigger in no state set, where nothing finds it again.
+     */
+    @Override
+    public boolean setTriggerState(final RedisTriggerState state, final double score, final String triggerHashKey, final boolean lock, Jedis jedis) throws JobPersistenceException {
+        if (state == null) {
+            return false;
+        }
+        final String lockKey = redisSchema.triggerLockKey(redisSchema.triggerKey(triggerHashKey));
+        final Transaction tx = jedis.multi();
+        try {
+            for (RedisTriggerState s : RedisTriggerState.values()) {
+                tx.zrem(redisSchema.triggerStateKey(s), triggerHashKey);
+            }
+            final Response<Long> added = tx.zadd(redisSchema.triggerStateKey(state), score, triggerHashKey);
+            if (lock) {
+                tx.set(lockKey, schedulerInstanceId, SetParams.setParams().px(TRIGGER_LOCK_TIMEOUT));
+            } else {
+                tx.del(lockKey);
+            }
+            tx.exec();
+            return added.get() == 1;
+        } finally {
+            tx.close();
+        }
+    }
+
+    @Override
+    public boolean setTriggerState(final RedisTriggerState state, final double score, final String triggerHashKey, Jedis jedis) throws JobPersistenceException {
+        return setTriggerState(state, score, triggerHashKey, false, jedis);
+    }
+
     /** number of triggers/jobs read per pipeline, to bound the size of a single request/response */
     private static final int BULK_CHUNK_SIZE = 500;
 
@@ -826,9 +862,7 @@ public class RedisStorage extends AbstractRedisStorage<Jedis> {
                         if (logger.isTraceEnabled()) {
                             logger.trace("Setting state of trigger " + trigger.getKey() + " for non-concurrent job " + job.getKey() + " to BLOCKED.");
                         }
-                        setTriggerState(RedisTriggerState.BLOCKED, score, nonConcurrentTriggerHashKey, jedis);
-                        // setting trigger state removes trigger locks, so re-lock
-                        lockTrigger(redisSchema.triggerKey(nonConcurrentTriggerHashKey), jedis);
+                        setTriggerState(RedisTriggerState.BLOCKED, score, nonConcurrentTriggerHashKey, true, jedis);
                     }
                     else{
                         score = jedis.zscore(redisSchema.triggerStateKey(RedisTriggerState.PAUSED), nonConcurrentTriggerHashKey);
@@ -836,9 +870,7 @@ public class RedisStorage extends AbstractRedisStorage<Jedis> {
                             if (logger.isTraceEnabled()) {
                                 logger.trace("Setting state of trigger " + trigger.getKey() + " for non-concurrent job " + job.getKey() + " to PAUSED_BLOCKED.");
                             }
-                            setTriggerState(RedisTriggerState.PAUSED_BLOCKED, score, nonConcurrentTriggerHashKey, jedis);
-                            // setting trigger state removes trigger locks, so re-lock
-                            lockTrigger(redisSchema.triggerKey(nonConcurrentTriggerHashKey), jedis);
+                            setTriggerState(RedisTriggerState.PAUSED_BLOCKED, score, nonConcurrentTriggerHashKey, true, jedis);
                         }
                     }
                 }

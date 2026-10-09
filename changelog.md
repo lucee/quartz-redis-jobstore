@@ -1,4 +1,16 @@
 # Changelog
+### 2.0.0.0-RC (Lucee fork, restart recovery)
+Recovery of the triggers of a scheduler which stopped or died, and atomic state changes.
+* **Heartbeat**: every scheduler registers as alive from a separate thread (`heartbeatInterval`, default 5 s, 0 turns it off), no longer only when it looks for work. The scheduling loop can be blocked for a long time (all worker threads busy) without the scheduler being taken for dead, so `clusterCheckinInterval` can be much shorter than the default 4 minutes (recommended: at least three times the heartbeat interval, for example 30000).
+* **`releaseTriggersInterval`** (default 10 minutes, as before): how often the triggers of dead schedulers are released. With a short `clusterCheckinInterval` set it to a similar value (for example 15000) to recover in well under a minute instead of 5 to 10 minutes.
+* **Clean stop**: on shutdown a scheduler unregisters itself and asks the others to release what it still owns right away. Not done while it still owns a running job (shutdown without waiting for the jobs), then it expires like a dead scheduler.
+* **Start**: a scheduler which starts takes over the triggers of dead schedulers first.
+* **Trigger state changes are atomic** (MULTI/EXEC, single Redis node): a trigger is never in no state set. Before, a scheduler which stopped between "remove" and "add" left the trigger in no state set, where nothing found it again. Blocked and acquired triggers are marked with their owner in the same step.
+* **Every acquired trigger is marked with its owner** (before: only triggers of jobs without concurrent execution). An acquired trigger without a marker (acquired by a scheduler running an older version) is only released when it is overdue by more than 60 s.
+* A blocked trigger is not released while the scheduler which blocked its job is alive, also when the trigger lock (10 minutes) has expired, so a job which runs longer than that is not started a second time.
+* Redis Cluster mode keeps the old, non atomic state changes (keys in different slots).
+* Do not mix with schedulers running 1.x with a short `clusterCheckinInterval`: they do not send a heartbeat.
+
 ### 1.2.0.1-RC (Lucee fork, [LDEV-6531](https://luceeserver.atlassian.net/browse/LDEV-6531))
 * `retrieveTrigger` and `retrieveJob` read the hash and the data map in one round trip (pipelined)
 * New `RedisJobStore.getAllTriggerDetails()`: all triggers with job and state in a few pipelined requests, independent of the number of triggers (takes the global lock once, so the result is a consistent snapshot)
