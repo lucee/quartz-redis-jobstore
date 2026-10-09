@@ -19,6 +19,10 @@ import redis.clients.jedis.commands.JedisCommands;
 import redis.clients.jedis.util.Pool;
 
 import java.util.*;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Joe Linn
@@ -118,6 +122,27 @@ public class RedisJobStore implements JobStore {
      */
     protected long clusterCheckinInterval = 4 * 60 * 1000;
 
+    /**
+     * Minimum time in ms between two runs which release the triggers of schedulers which are not alive any more.
+     * The default is 10 minutes, a node which died is noticed after at most clusterCheckinInterval + releaseTriggersInterval.
+     */
+    protected long releaseTriggersInterval = 10 * 60 * 1000;
+
+    /**
+     * Time in ms between two signs of life of this scheduler. They are sent by a separate thread, so a scheduler is not
+     * taken for dead while all its worker threads are busy. 0 turns this off: the scheduler then only registers when it
+     * looks for work, clusterCheckinInterval has to be longer than the longest time the scheduling loop can be blocked.
+     */
+    protected long heartbeatInterval = 5_000;
+
+    /**
+     * Check a connection with a PING each time it is taken from the pool (default, safest). Turning it off saves one round
+     * trip per operation, a connection which broke since it was used last then makes the next operation fail once.
+     */
+    protected boolean testOnBorrow = true;
+
+    private ScheduledExecutorService heartbeat;
+
 
     public RedisJobStore setJedisPool(Pool<Jedis> jedisPool) {
         this.jedisPool = jedisPool;
@@ -135,6 +160,22 @@ public class RedisJobStore implements JobStore {
         this.misfireThreshold = misfireThreshold;
     }
 
+
+    public void setReleaseTriggersInterval(long interval) {
+        this.releaseTriggersInterval = interval;
+    }
+
+    public void setTestOnBorrow(boolean testOnBorrow) {
+        this.testOnBorrow = testOnBorrow;
+    }
+
+    public void setHeartbeatInterval(long interval) {
+        this.heartbeatInterval = interval;
+    }
+
+    public String getInstanceId() {
+        return instanceId;
+    }
 
     public void setClusterCheckinInterval(long interval) {
         this.clusterCheckinInterval = interval;
@@ -169,7 +210,7 @@ public class RedisJobStore implements JobStore {
             storage = new RedisClusterStorage(redisSchema, mapper, signaler, instanceId, lockTimeout);
         } else if (jedisPool == null) {
             JedisPoolConfig jedisPoolConfig = new JedisPoolConfig();
-            jedisPoolConfig.setTestOnBorrow(true);
+            jedisPoolConfig.setTestOnBorrow(testOnBorrow);
             if (redisSentinel) {
                 Set<HostAndPort> nodes = buildNodesSetFromHost();
                 Set<String> nodesAsStrings = new HashSet<>();
@@ -189,7 +230,8 @@ public class RedisJobStore implements JobStore {
             storage = new RedisStorage(redisSchema, mapper, signaler, instanceId, lockTimeout);
         }
         storage.setMisfireThreshold(misfireThreshold)
-                .setClusterCheckInterval(clusterCheckinInterval);
+                .setClusterCheckInterval(clusterCheckinInterval)
+                .setReleaseTriggersInterval(releaseTriggersInterval);
     }
 
     /**
@@ -215,7 +257,61 @@ public class RedisJobStore implements JobStore {
      */
     @Override
     public void schedulerStarted() throws SchedulerException {
+        // take over what schedulers which are not alive any more left behind, then register as alive and keep doing so
+        doWithLock(new LockCallbackWithoutResult() {
+            @Override
+            public Void doWithLock(JedisCommands jedis) throws JobPersistenceException {
+                storage.releaseAllOrphanedTriggers(jedis);
+                storage.heartbeat(jedis);
+                return null;
+            }
+        }, "Could not release the triggers of stopped schedulers.");
+        startHeartbeat();
+    }
 
+    private synchronized void startHeartbeat() {
+        if (heartbeatInterval <= 0 || heartbeat != null) {
+            return;
+        }
+        if (clusterCheckinInterval < 3 * heartbeatInterval) {
+            logger.warn("clusterCheckinInterval ({} ms) should be at least three times the heartbeatInterval ({} ms), otherwise a short pause makes this scheduler look dead.",
+                    clusterCheckinInterval, heartbeatInterval);
+        }
+        storage.setHeartbeatRunning(true);
+        heartbeat = Executors.newSingleThreadScheduledExecutor(new ThreadFactory() {
+            @Override
+            public Thread newThread(Runnable r) {
+                Thread t = new Thread(r, "RedisJobStore-heartbeat-" + instanceId);
+                t.setDaemon(true);
+                return t;
+            }
+        });
+        heartbeat.scheduleWithFixedDelay(new Runnable() {
+            @Override
+            public void run() {
+                JedisCommands jedis = null;
+                try {
+                    jedis = getResource();
+                    storage.heartbeat(jedis);
+                } catch (Throwable t) {
+                    logger.warn("Could not register the scheduler as alive: " + t.getMessage());
+                } finally {
+                    if (jedis instanceof Jedis) {
+                        ((Jedis) jedis).close();
+                    }
+                }
+            }
+        }, heartbeatInterval, heartbeatInterval, TimeUnit.MILLISECONDS);
+    }
+
+    private synchronized void stopHeartbeat() {
+        if (heartbeat != null) {
+            heartbeat.shutdownNow();
+            heartbeat = null;
+            if (storage != null) {
+                storage.setHeartbeatRunning(false);
+            }
+        }
     }
 
     /**
@@ -243,6 +339,21 @@ public class RedisJobStore implements JobStore {
      */
     @Override
     public void shutdown() {
+        stopHeartbeat();
+        if (storage != null && (jedisPool != null || jedisCluster != null)) {
+            // tell the other schedulers we are gone, they release what we still own without waiting for the check-in interval
+            JedisCommands jedis = null;
+            try {
+                jedis = getResource();
+                storage.markInstanceStopped(jedis);
+            } catch (Throwable t) {
+                logger.warn("Could not unregister the scheduler: " + t.getMessage());
+            } finally {
+                if (jedis instanceof Jedis) {
+                    ((Jedis) jedis).close();
+                }
+            }
+        }
         if(jedisPool != null){
             jedisPool.destroy();
         }
