@@ -65,6 +65,32 @@ org.quartz.jobStore.lockTimeout = 30000
 org.quartz.jobStore.ssl = <true or false>
 ```
 
+### Recovery of stopped and dead schedulers (2.0)
+
+Every scheduler registers as alive from a separate thread. The triggers a scheduler owns (acquired, or blocked because a job
+which must not run concurrently is running) are taken over by the others when it has not been seen for `clusterCheckinInterval`
+and a release run happens. Defaults keep the behaviour of 1.x (4 minutes and 10 minutes); for a quick recovery set shorter values:
+
+```
+# a scheduler which was not seen for this long is dead (ms, default 240000). At least three times the heartbeat interval
+org.quartz.jobStore.clusterCheckinInterval = 30000
+
+# how often the triggers of dead schedulers are released (ms, default 600000)
+org.quartz.jobStore.releaseTriggersInterval = 15000
+
+# how often a scheduler tells that it is alive (ms, default 5000, 0 turns the heartbeat off)
+org.quartz.jobStore.heartbeatInterval = 5000
+
+# check a connection with a PING when it is taken from the pool (default true). false saves one round trip per operation,
+# a connection which broke since it was last used then makes the next operation fail once
+org.quartz.jobStore.testOnBorrow = true
+```
+
+A job is taken over after at most `clusterCheckinInterval + releaseTriggersInterval` (45 s with the values above, measured:
+41 to 48 s; with the defaults 5 to 10 minutes). A scheduler which is shut down without running jobs unregisters, the others
+take over at once. Do not set `clusterCheckinInterval` shorter than the longest pause a scheduler can have without
+sending the heartbeat (a long garbage collection): its triggers would be taken over while it is still alive.
+
 ## Limitations
 All GroupMatcher comparators have been implemented. 
 Aside from that, the same limitations outlined in [redis-quartz's readme](https://github.com/RedisLabs/redis-quartz#limitations) apply.
