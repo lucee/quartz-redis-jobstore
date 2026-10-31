@@ -1,4 +1,7 @@
 # Changelog
+### 2.0.0.1 (Lucee fork)
+* Final release of 2.0.0.1-RC, same code.
+
 ### 2.0.0.1-RC (Lucee fork)
 * A one-shot trigger is recorded when it fires (previous fire time, times triggered, next fire time cleared) and deleted when its run finishes, also when the job threw, so orphan recovery cannot run it a second time (LDEV-6576).
 
